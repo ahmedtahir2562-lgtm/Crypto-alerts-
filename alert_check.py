@@ -30,24 +30,31 @@ EMAIL_PASSWORD = os.environ.get("ALERT_EMAIL_PASSWORD")
 EMAIL_TO = os.environ.get("ALERT_EMAIL_TO", EMAIL_FROM)
 # ======================================================================
 
-BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
-BINANCE_EXCHANGE_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
-
-
-def get_all_usdt_symbols():
-    resp = requests.get(BINANCE_EXCHANGE_INFO_URL, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    return [
-        s["symbol"] for s in data["symbols"]
-        if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"
-    ]
+COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
+PAGES_TO_FETCH = 4          # 4 pages x 250 = top 1000 coins by market cap
+PER_PAGE = 250
 
 
 def get_prices():
-    resp = requests.get(BINANCE_PRICE_URL, timeout=15)
-    resp.raise_for_status()
-    return {item["symbol"]: float(item["price"]) for item in resp.json()}
+    """Fetch current USD prices for the top coins by market cap from CoinGecko.
+    Returns a dict of {coin_id: price}, e.g. {"bitcoin": 65000.0, ...}."""
+    all_prices = {}
+    for page in range(1, PAGES_TO_FETCH + 1):
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": PER_PAGE,
+            "page": page,
+        }
+        resp = requests.get(COINGECKO_MARKETS_URL, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data:
+            break
+        for coin in data:
+            if coin.get("current_price") is not None:
+                all_prices[coin["id"]] = float(coin["current_price"])
+    return all_prices
 
 
 def load_history():
@@ -84,17 +91,12 @@ def main():
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
 
-    symbols = get_all_usdt_symbols()
     current_prices = get_prices()
     history = load_history()
 
     alerts_sent = 0
 
-    for symbol in symbols:
-        price = current_prices.get(symbol)
-        if price is None:
-            continue
-
+    for symbol, price in current_prices.items():
         prev = history.get(symbol)
 
         if prev is not None:
@@ -129,7 +131,7 @@ def main():
         }
 
     save_history(history)
-    print(f"Checked {len(symbols)} coins. Alerts sent this run: {alerts_sent}")
+    print(f"Checked {len(current_prices)} coins. Alerts sent this run: {alerts_sent}")
 
 
 if __name__ == "__main__":
