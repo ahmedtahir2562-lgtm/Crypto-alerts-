@@ -19,7 +19,7 @@ from email.mime.text import MIMEText
 from datetime import datetime, timezone
 
 # ============================== CONFIG ==============================
-MOVE_THRESHOLD_PCT = 0.3       # % move since the last check that triggers an alert
+MOVE_THRESHOLD_PCT = 5.0      # % move since the last check that triggers an alert
 ALERT_COOLDOWN_MINUTES = 30       # don't re-alert on the same coin within this window
 HISTORY_FILE = "price_history.json"
 
