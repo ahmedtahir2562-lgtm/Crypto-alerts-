@@ -1,12 +1,12 @@
 """
-Crypto Volatility Alert Bot - Bitget version (for GitHub Actions)
+Crypto Volatility Alert Bot - Bitget version (since-last-check)
 ====================================================================
-Runs ONCE per execution (triggered on a schedule by GitHub Actions).
-Checks the 24-hour % price change for every coin available on Bitget spot
-market, and emails you when any coin has moved MOVE_THRESHOLD_PCT or more.
+Runs ONCE per execution (triggered on a schedule by GitHub Actions,
+e.g. every 15 minutes).
 
-A small cooldown file (alert_cooldown.json) is kept so the same coin
-doesn't spam you repeatedly while it's still up/down a lot.
+Compares each coin's current price on Bitget against the price stored from
+the PREVIOUS run (price_history.json) and alerts if it moved
+MOVE_THRESHOLD_PCT or more since then - not the 24h change.
 """
 
 import os
@@ -17,9 +17,9 @@ from email.mime.text import MIMEText
 from datetime import datetime, timezone
 
 # ============================== CONFIG ==============================
-MOVE_THRESHOLD_PCT = 5.0          # 24h % move that triggers an alert
+MOVE_THRESHOLD_PCT = 5.0          # % move since the last check that triggers an alert
 ALERT_COOLDOWN_MINUTES = 60       # don't re-alert on the same coin within this window
-COOLDOWN_FILE = "alert_cooldown.json"
+HISTORY_FILE = "price_history.json"
 
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
@@ -31,39 +31,38 @@ EMAIL_TO = os.environ.get("ALERT_EMAIL_TO", EMAIL_FROM)
 BITGET_TICKERS_URL = "https://api.bitget.com/api/v2/spot/market/tickers"
 
 
-def get_bitget_tickers():
-    """Fetch 24h ticker data for every coin on Bitget spot market.
-    Returns a list of dicts with 'symbol' and 'pct_change' (float, e.g. 5.23 for +5.23%)."""
+def get_bitget_prices():
+    """Fetch current prices for every coin on Bitget spot market.
+    Returns a dict of {symbol: price}."""
     resp = requests.get(BITGET_TICKERS_URL, timeout=20)
     resp.raise_for_status()
     payload = resp.json()
     data = payload.get("data", [])
 
-    results = []
+    prices = {}
     for item in data:
         symbol = item.get("symbol")
-        # Bitget returns the 24h change as a fraction, e.g. 0.0523 for +5.23%
-        change_raw = item.get("change24h") or item.get("changeUtc24h")
-        if symbol is None or change_raw is None:
+        # Bitget's current/last traded price field
+        price_raw = item.get("lastPr") or item.get("close")
+        if symbol is None or price_raw is None:
             continue
         try:
-            pct_change = float(change_raw) * 100
+            prices[symbol] = float(price_raw)
         except (TypeError, ValueError):
             continue
-        results.append({"symbol": symbol, "pct_change": pct_change})
-    return results
+    return prices
 
 
-def load_cooldowns():
-    if os.path.exists(COOLDOWN_FILE):
-        with open(COOLDOWN_FILE, "r") as f:
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, "r") as f:
             return json.load(f)
     return {}
 
 
-def save_cooldowns(cooldowns):
-    with open(COOLDOWN_FILE, "w") as f:
-        json.dump(cooldowns, f)
+def save_history(history):
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(history, f)
 
 
 def send_email_alert(subject, body):
@@ -86,40 +85,49 @@ def send_email_alert(subject, body):
 
 def main():
     now = datetime.now(timezone.utc)
-    tickers = get_bitget_tickers()
-    cooldowns = load_cooldowns()
+    now_iso = now.isoformat()
+
+    current_prices = get_bitget_prices()
+    history = load_history()
 
     alerts_sent = 0
 
-    for t in tickers:
-        symbol = t["symbol"]
-        pct_change = t["pct_change"]
+    for symbol, price in current_prices.items():
+        prev = history.get(symbol)
 
-        if abs(pct_change) < MOVE_THRESHOLD_PCT:
-            continue
+        if prev is not None:
+            prev_price = prev["price"]
+            pct_change = (price - prev_price) / prev_price * 100
 
-        last_alert = cooldowns.get(symbol)
-        cooldown_ok = True
-        if last_alert:
-            last_alert_time = datetime.fromisoformat(last_alert)
-            cooldown_ok = (now - last_alert_time).total_seconds() >= ALERT_COOLDOWN_MINUTES * 60
+            last_alert = prev.get("last_alert")
+            cooldown_ok = True
+            if last_alert:
+                last_alert_time = datetime.fromisoformat(last_alert)
+                cooldown_ok = (now - last_alert_time).total_seconds() >= ALERT_COOLDOWN_MINUTES * 60
 
-        if not cooldown_ok:
-            continue
+            if abs(pct_change) >= MOVE_THRESHOLD_PCT and cooldown_ok:
+                direction = "up" if pct_change > 0 else "down"
+                subject = f"[Bitget Alert] {symbol} moved {pct_change:+.2f}% ({direction})"
+                body = (
+                    f"{symbol} on Bitget moved {pct_change:+.2f}% since the last check.\n"
+                    f"From {prev_price} to {price}.\n"
+                    f"Time (UTC): {now_iso}"
+                )
+                print(subject)
+                send_email_alert(subject, body)
+                alerts_sent += 1
+                history[symbol] = {"price": price, "time": now_iso, "last_alert": now_iso}
+                continue
 
-        direction = "up" if pct_change > 0 else "down"
-        subject = f"[Bitget Alert] {symbol} moved {pct_change:+.2f}% in 24h ({direction})"
-        body = (
-            f"{symbol} on Bitget has moved {pct_change:+.2f}% over the last 24 hours.\n"
-            f"Time (UTC): {now.isoformat()}"
-        )
-        print(subject)
-        send_email_alert(subject, body)
-        alerts_sent += 1
-        cooldowns[symbol] = now.isoformat()
+        # update stored price, keep last_alert if it exists
+        history[symbol] = {
+            "price": price,
+            "time": now_iso,
+            "last_alert": prev.get("last_alert") if prev else None,
+        }
 
-    save_cooldowns(cooldowns)
-    print(f"Checked {len(tickers)} coins on Bitget. Alerts sent this run: {alerts_sent}")
+    save_history(history)
+    print(f"Checked {len(current_prices)} coins on Bitget. Alerts sent this run: {alerts_sent}")
 
 
 if __name__ == "__main__":
